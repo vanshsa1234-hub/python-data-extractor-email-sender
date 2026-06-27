@@ -1,5 +1,4 @@
 data/
-config.py
 *.db
 *.csv
 __pycache__/
