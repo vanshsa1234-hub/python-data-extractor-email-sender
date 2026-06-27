@@ -33,11 +33,12 @@ from bs4 import BeautifulSoup
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Playwright imported lazily — module loads even if not installed
+# On Streamlit Cloud, Playwright is not available — fails silently
 _playwright_available = False
 try:
     from playwright.sync_api import sync_playwright
     _playwright_available = True
-except ImportError:
+except Exception:
     pass
 
 from config import REQUEST_DELAY_MIN, REQUEST_DELAY_MAX, DATA_DIR
