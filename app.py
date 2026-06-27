@@ -315,46 +315,104 @@ elif page == "📧 Email":
 
     st.markdown(f"**{len(df)} leads available in leads.csv**")
 
-    col1, col2 = st.columns(2)
+    # ── User enters their own Gmail credentials ────────────────────────────────
+    st.markdown("### 📬 Your Gmail Credentials")
+    st.info("Emails will be sent from your own Gmail account. Your credentials are never stored.")
+
+    cred_col1, cred_col2, cred_col3 = st.columns(3)
+    with cred_col1:
+        user_email = st.text_input("Your Gmail Address", placeholder="you@gmail.com")
+    with cred_col2:
+        user_password = st.text_input("Gmail App Password",
+                                       type="password",
+                                       help="Generate at myaccount.google.com → Security → App Passwords")
+    with cred_col3:
+        user_sender_name = st.text_input("Sender Name", placeholder="Your Name")
+
+    with st.expander("ℹ️ How to get a Gmail App Password"):
+        st.markdown("""
+        1. Go to **myaccount.google.com**
+        2. Click **Security**
+        3. Enable **2-Step Verification** if not already on
+        4. Search **App Passwords**
+        5. Select app: **Mail** → Generate
+        6. Copy the 16-character password and paste above
+        """)
+
+    st.markdown("---")
+
+    # ── Email compose ──────────────────────────────────────────────────────────
+    st.markdown("### ✏️ Compose Email")
+    col1, col2 = st.columns([3, 1])
     with col1:
-        subject_tmpl = st.text_input(
-            "Subject line",
-            value="Quick question about {{ company if company else 'your work' }}",
-            help="Supports Jinja2 variables: {{ first_name }}, {{ company }}, {{ title }}"
-        )
-        custom_msg = st.text_area(
-            "Email body message",
-            value="I came across your profile and thought there might be a great opportunity for us to connect.",
-            height=140,
-        )
+        subject = st.text_input("Subject line", value="Partnership Opportunity",
+                                 placeholder="Write your email subject here...")
+        body = st.text_area("Email body", height=260,
+                             value="""Dear Sir/Madam,
+
+I hope this email finds you well.
+
+I wanted to reach out regarding a potential opportunity that I believe could be of mutual benefit.
+
+Please let me know if you would be open to a brief conversation.
+
+Looking forward to hearing from you.
+
+Best regards,
+""" + (user_sender_name or "Your Name"))
+
     with col2:
-        st.markdown("**Send settings**")
+        st.markdown("**⚙️ Send settings**")
         dry_run = st.checkbox("🧪 Dry run (don't actually send)", value=True)
-        limit   = st.number_input("Max emails to send this run", 1, 200, 50)
+        limit   = st.number_input("Max emails this run", 1, 200, 50)
         st.markdown("---")
-        st.markdown("**Preview** (first lead)")
-        if not df.empty:
-            sample = df.iloc[0].to_dict()
-            from emailer.sender import render_email
-            from jinja2 import Template
-            try:
-                preview_subj = Template(subject_tmpl).render(**sample,
-                    first_name=(str(sample.get("name","")).split() or ["there"])[0])
-                st.caption(f"Subject: **{preview_subj}**")
-            except Exception:
-                st.caption("Subject preview error — check Jinja2 syntax")
+        st.caption(f"Subject: **{subject}**")
+        st.caption(f"Leads targeted: **{min(limit, len(df))}**")
+
+    with st.expander("👁️ Preview full email"):
+        st.markdown(f"**Subject:** {subject}")
+        st.markdown("---")
+        st.markdown(body)
 
     if st.button("📤 Send Emails", type="primary"):
-        from emailer.sender import bulk_send
+
+        # Validate credentials first
+        if not user_email or not user_password:
+            st.error("❌ Please enter your Gmail address and App Password above.")
+            st.stop()
+
+        if not user_email.endswith("@gmail.com"):
+            st.error("❌ Only Gmail addresses are supported.")
+            st.stop()
+
+        from emailer.sender import bulk_send, send_email
         from emailer.tracker import is_unsubscribed
         from scraper.cleaner import is_valid_email
+        import config as _cfg
+
+        # Temporarily override config with user credentials
+        _cfg.EMAIL_ADDRESS  = user_email
+        _cfg.EMAIL_PASSWORD = user_password
+        _cfg.SENDER_NAME    = user_sender_name or user_email
 
         leads = df.to_dict("records")
-        sendable = [
-            l for l in leads[:limit]
-            if l.get("email") and is_valid_email(str(l["email"]))
-               and not is_unsubscribed(str(l["email"]))
-        ]
+
+        # Debug breakdown
+        debug_rows = []
+        sendable   = []
+        for l in leads[:limit]:
+            email   = str(l.get("email", "")).strip()
+            valid   = is_valid_email(email) if email else False
+            unsub   = is_unsubscribed(email) if email else False
+            include = bool(email) and valid and not unsub
+            debug_rows.append({"email": email, "valid": valid,
+                                "unsubscribed": unsub, "will_send": include})
+            if include:
+                sendable.append(l)
+
+        with st.expander("🔍 Lead filter breakdown", expanded=not bool(sendable)):
+            import pandas as _pd
+            st.dataframe(_pd.DataFrame(debug_rows), use_container_width=True)
 
         if not sendable:
             st.error("No valid sendable leads after filtering.")
@@ -363,15 +421,15 @@ elif page == "📧 Email":
             with st.spinner(f"{'Dry-running' if dry_run else 'Sending'} {len(sendable)} emails…"):
                 summary = bulk_send(
                     leads=sendable,
-                    subject_template=subject_tmpl,
-                    custom_message=custom_msg,
+                    subject_template=subject,
+                    custom_message=body,
                     dry_run=dry_run,
                 )
             progress.progress(1.0, text="Done!")
             st.success(f"✅ {'Dry run' if dry_run else 'Send'} complete!")
             col_s, col_f, col_sk = st.columns(3)
-            col_s.metric("Sent",    summary["sent"])
-            col_f.metric("Failed",  summary["failed"])
+            col_s.metric("Sent",     summary["sent"])
+            col_f.metric("Failed",   summary["failed"])
             col_sk.metric("Skipped", summary["skipped"])
 
 
@@ -698,79 +756,42 @@ elif page == "✅ Verify Emails":
                 keep_risky = st.checkbox("Keep risky emails", value=True,
                     help="Risky = DNS passed but SMTP inconclusive.")
 
-            # ── Session state keeps results alive across re-runs ──────────
-            if "ver_results" not in st.session_state:
-                st.session_state.ver_results  = None
-                st.session_state.ver_df_clean = None
-                st.session_state.ver_orig_len = 0
-
             if st.button("🔍 Verify All Emails", type="primary"):
-                from scraper.email_verifier import verify_bulk
-                from collections import Counter
-
-                emails_list  = df["email"].dropna().astype(str).tolist()
-                progress_bar = st.progress(0, text="Starting verification…")
+                from scraper.email_verifier import verify_bulk, filter_verified
+                emails_list = df["email"].dropna().tolist()
+                progress_bar = st.progress(0, text="Verifying…")
                 with st.spinner(f"Verifying {len(emails_list)} emails…"):
                     results = verify_bulk(emails_list, smtp_check=smtp_check,
                                           max_workers=workers, delay=0.3)
                 progress_bar.progress(1.0, text="Done!")
 
-                include   = ["valid", "catch_all"] + (["risky"] if keep_risky else [])
-                valid_set = {r["email"] for r in results if r["status"] in include}
-                df_clean  = df[df["email"].isin(valid_set)].reset_index(drop=True)
-
-                # Store in session_state so they survive the save button click
-                st.session_state.ver_results  = results
-                st.session_state.ver_df_clean = df_clean
-                st.session_state.ver_orig_len = len(df)
-
-            # ── Show results whenever they exist in session ────────────────────
-            if st.session_state.ver_results is not None:
-                from collections import Counter
-                results  = st.session_state.ver_results
-                df_clean = st.session_state.ver_df_clean
-                orig_len = st.session_state.ver_orig_len
-
-                ver_df = pd.DataFrame(results)[["email", "status", "reason", "mx"]]
+                ver_df = pd.DataFrame(results)[["email","status","reason","mx"]]
                 st.dataframe(ver_df, use_container_width=True)
 
+                from collections import Counter
                 counts = Counter(r["status"] for r in results)
-                c1, c2, c3, c4, c5 = st.columns(5)
+                c1,c2,c3,c4,c5 = st.columns(5)
                 c1.metric("✅ Valid",     counts.get("valid",     0))
                 c2.metric("⚠️ Risky",     counts.get("risky",     0))
                 c3.metric("🔄 Catch-all", counts.get("catch_all", 0))
                 c4.metric("❌ Invalid",   counts.get("invalid",   0))
                 c5.metric("⏱️ Timeout",   counts.get("timeout",   0))
 
+                include = ["valid", "catch_all"] + (["risky"] if keep_risky else [])
+                valid_set = {r["email"] for r in results if r["status"] in include}
+                df_clean  = df[df["email"].isin(valid_set)].reset_index(drop=True)
+
                 st.markdown("---")
-                col_k, col_r = st.columns(2)
-                col_k.metric("✅ Leads to keep",   len(df_clean))
-                col_r.metric("🗑️ Leads removed",   orig_len - len(df_clean))
+                st.metric("Emails kept", len(df_clean))
+                st.metric("Removed", len(df) - len(df_clean))
 
-                if df_clean.empty:
-                    st.warning("No leads passed verification.")
-                else:
-                    st.markdown("**Preview — leads that will be saved:**")
-                    st.dataframe(df_clean, use_container_width=True, height=200)
-                    st.markdown("---")
-
-                    # Save button — outside verify block, always visible after verification
-                    if st.button(
-                        f"💾 Save {len(df_clean)} verified leads to leads.csv",
-                        type="primary",
-                        key="save_verified_btn",
-                    ):
+                if is_admin():
+                    if st.button("💾 Save verified leads to leads.csv"):
                         save_leads_df(df_clean)
-                        # Clear session state after save
-                        st.session_state.ver_results  = None
-                        st.session_state.ver_df_clean = None
-                        st.session_state.ver_orig_len = 0
-                        st.success(
-                            f"✅ leads.csv updated! "
-                            f"Kept {len(df_clean)} verified leads, "
-                            f"removed {orig_len - len(df_clean)} invalid ones."
-                        )
+                        st.success(f"✅ Saved {len(df_clean)} verified leads")
                         st.rerun()
+                else:
+                    st.info("🔒 Log in as admin to save verified results back to the CSV.")
 
     with tab_manual:
         st.markdown("Enter emails one per line to verify:")
