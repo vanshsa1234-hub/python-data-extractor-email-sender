@@ -1,23 +1,29 @@
 """
 admin_auth.py
 =============
-Simple admin authentication for the Streamlit dashboard.
-Credentials are stored as a bcrypt hash in data/admin.db — 
-the plain-text password is never saved anywhere.
+Multi-user authentication system.
 
-Default credentials (change immediately after first login):
-  Username: admin
-  Password: admin123
+Every user must register before using the tool.
+Each user's leads are stored separately — user A cannot see user B's data.
 
-To change password, run:
-    python admin_auth.py --change
+DB schema:
+  users table:
+    id, username, password_hash, role (admin/user), created_at
+
+  leads table:
+    id, user_id, email, phone, website, scraped_at
+
+Roles:
+  admin — can see all users, manage accounts
+  user  — can only see their own leads
 """
 
 import sqlite3
 import hashlib
 import logging
-import argparse
+import re
 from pathlib import Path
+from datetime import datetime
 
 log = logging.getLogger(__name__)
 
@@ -26,60 +32,223 @@ DB_PATH = "data/admin.db"
 
 def _conn() -> sqlite3.Connection:
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
-    return sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 def _hash(password: str) -> str:
-    """SHA-256 hash of the password (good enough for local tool)."""
     return hashlib.sha256(password.strip().encode()).hexdigest()
 
 
-def init_admin_db() -> None:
-    """Create admin table and set default credentials if not already set."""
+def init_db() -> None:
+    """Create all tables. Safe to call multiple times."""
     conn = _conn()
+
+    # Users table
     conn.execute("""
-        CREATE TABLE IF NOT EXISTS admin_users (
-            id          INTEGER PRIMARY KEY,
-            username    TEXT    NOT NULL UNIQUE,
-            password_hash TEXT  NOT NULL,
-            created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        CREATE TABLE IF NOT EXISTS users (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            username      TEXT    NOT NULL UNIQUE,
+            password_hash TEXT    NOT NULL,
+            role          TEXT    NOT NULL DEFAULT 'user',
+            created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+
+    # Per-user leads table
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS user_leads (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id     INTEGER NOT NULL,
+            email       TEXT    NOT NULL,
+            phone       TEXT    DEFAULT '',
+            website     TEXT    DEFAULT '',
+            scraped_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id),
+            UNIQUE(user_id, email)
+        )
+    """)
+
+    # Per-user sent emails log
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS user_sent_emails (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id   INTEGER NOT NULL,
+            email     TEXT    NOT NULL,
+            subject   TEXT,
+            status    TEXT    NOT NULL,
+            sent_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+    """)
+
     conn.commit()
 
-    # Insert default admin if no users exist
-    existing = conn.execute("SELECT COUNT(*) FROM admin_users").fetchone()[0]
-    if existing == 0:
+    # NO default credentials — admin must be created on first run via the app
+    conn.commit()
+    conn.close()
+
+
+# ── Registration ───────────────────────────────────────────────────────────────
+
+def register_user(username: str, password: str) -> tuple[bool, str]:
+    """
+    Register a new user account.
+    Returns (success, message).
+    """
+    username = username.strip().lower()
+
+    if not username or len(username) < 3:
+        return False, "Username must be at least 3 characters."
+    if not re.match(r'^[a-zA-Z0-9_]+$', username):
+        return False, "Username can only contain letters, numbers and underscores."
+    if len(password) < 6:
+        return False, "Password must be at least 6 characters."
+
+    init_db()
+    conn = _conn()
+    try:
         conn.execute(
-            "INSERT INTO admin_users (username, password_hash) VALUES (?, ?)",
-            ("admin", _hash("admin123"))
+            "INSERT INTO users (username, password_hash, role) VALUES (?,?,?)",
+            (username, _hash(password), "user")
         )
         conn.commit()
-        log.info("Default admin created. Username: admin | Password: admin123")
+        conn.close()
+        return True, f"Account created! Welcome, {username}."
+    except sqlite3.IntegrityError:
+        conn.close()
+        return False, f"Username '{username}' is already taken."
+
+
+# ── Login ──────────────────────────────────────────────────────────────────────
+
+def login_user(username: str, password: str) -> tuple[bool, dict]:
+    """
+    Verify credentials.
+    Returns (success, user_dict) where user_dict has id, username, role.
+    """
+    init_db()
+    username = username.strip().lower()
+    conn = _conn()
+    row = conn.execute(
+        "SELECT id, username, role FROM users WHERE username=? AND password_hash=?",
+        (username, _hash(password))
+    ).fetchone()
     conn.close()
+
+    if row:
+        return True, {"id": row["id"], "username": row["username"], "role": row["role"]}
+    return False, {}
 
 
 def verify_credentials(username: str, password: str) -> bool:
-    """Return True if username + password match stored credentials."""
-    init_admin_db()
+    """Legacy compatibility — returns True/False only."""
+    success, _ = login_user(username, password)
+    return success
+
+
+# ── User leads (isolated per user) ────────────────────────────────────────────
+
+def save_user_leads(user_id: int, leads: list[dict]) -> int:
+    """
+    Save scraped leads for a specific user.
+    Skips duplicates (same user + email).
+    Returns count of newly inserted leads.
+    """
+    init_db()
     conn = _conn()
-    row = conn.execute(
-        "SELECT password_hash FROM admin_users WHERE username = ?",
-        (username.strip().lower(),)
-    ).fetchone()
+    inserted = 0
+    for lead in leads:
+        email   = lead.get("email", "").strip().lower()
+        phone   = str(lead.get("phone", "")).strip()
+        website = lead.get("website", lead.get("url", lead.get("source", ""))).strip()
+        if not email:
+            continue
+        try:
+            conn.execute(
+                "INSERT OR IGNORE INTO user_leads (user_id, email, phone, website) VALUES (?,?,?,?)",
+                (user_id, email, phone, website)
+            )
+            if conn.total_changes > inserted:
+                inserted += 1
+        except sqlite3.Error:
+            pass
+    conn.commit()
     conn.close()
-    if not row:
-        return False
-    return row[0] == _hash(password)
+    return inserted
+
+
+def get_user_leads(user_id: int) -> list[dict]:
+    """Return all leads belonging to a specific user."""
+    init_db()
+    conn = _conn()
+    rows = conn.execute(
+        "SELECT email, phone, website, scraped_at FROM user_leads WHERE user_id=? ORDER BY scraped_at DESC",
+        (user_id,)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def delete_user_lead(user_id: int, email: str) -> bool:
+    """Delete a specific lead for a user."""
+    init_db()
+    conn = _conn()
+    conn.execute(
+        "DELETE FROM user_leads WHERE user_id=? AND email=?",
+        (user_id, email.strip().lower())
+    )
+    changed = conn.total_changes > 0
+    conn.commit()
+    conn.close()
+    return changed
+
+
+def clear_user_leads(user_id: int) -> int:
+    """Delete all leads for a user. Returns count deleted."""
+    init_db()
+    conn = _conn()
+    conn.execute("DELETE FROM user_leads WHERE user_id=?", (user_id,))
+    n = conn.total_changes
+    conn.commit()
+    conn.close()
+    return n
+
+
+# ── Admin functions ────────────────────────────────────────────────────────────
+
+def list_users() -> list[dict]:
+    """Return all users (admin only)."""
+    init_db()
+    conn = _conn()
+    rows = conn.execute(
+        "SELECT id, username, role, created_at FROM users ORDER BY created_at"
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def delete_user(user_id: int) -> bool:
+    """Delete a user and all their leads (admin only)."""
+    init_db()
+    conn = _conn()
+    conn.execute("DELETE FROM user_leads WHERE user_id=?", (user_id,))
+    conn.execute("DELETE FROM users WHERE id=?", (user_id,))
+    changed = conn.total_changes > 0
+    conn.commit()
+    conn.close()
+    return changed
 
 
 def change_password(username: str, old_password: str, new_password: str) -> bool:
-    """Change password for an existing admin user."""
+    """Change password for a user."""
     if not verify_credentials(username, old_password):
         return False
+    init_db()
     conn = _conn()
     conn.execute(
-        "UPDATE admin_users SET password_hash = ? WHERE username = ?",
+        "UPDATE users SET password_hash=? WHERE username=?",
         (_hash(new_password), username.strip().lower())
     )
     conn.commit()
@@ -87,77 +256,29 @@ def change_password(username: str, old_password: str, new_password: str) -> bool
     return True
 
 
-def add_admin(username: str, password: str) -> bool:
-    """Add a new admin user. Returns False if username already exists."""
-    init_admin_db()
+def get_user_lead_count(user_id: int) -> int:
+    """Return how many leads a user has."""
+    init_db()
     conn = _conn()
-    try:
-        conn.execute(
-            "INSERT INTO admin_users (username, password_hash) VALUES (?, ?)",
-            (username.strip().lower(), _hash(password))
-        )
-        conn.commit()
-        conn.close()
-        return True
-    except sqlite3.IntegrityError:
-        conn.close()
-        return False
-
-
-def delete_admin(username: str) -> bool:
-    """Remove an admin user (cannot remove last admin)."""
-    conn = _conn()
-    count = conn.execute("SELECT COUNT(*) FROM admin_users").fetchone()[0]
-    if count <= 1:
-        conn.close()
-        return False
-    conn.execute("DELETE FROM admin_users WHERE username = ?", (username,))
-    conn.commit()
+    n = conn.execute(
+        "SELECT COUNT(*) FROM user_leads WHERE user_id=?", (user_id,)
+    ).fetchone()[0]
     conn.close()
-    return True
+    return n
 
 
-def list_admins() -> list[str]:
-    """Return list of admin usernames."""
-    init_admin_db()
+def is_admin_user(user_id: int) -> bool:
+    """Check if a user has admin role."""
+    init_db()
     conn = _conn()
-    rows = conn.execute("SELECT username FROM admin_users").fetchall()
+    row = conn.execute(
+        "SELECT role FROM users WHERE id=?", (user_id,)
+    ).fetchone()
     conn.close()
-    return [r[0] for r in rows]
+    return row and row["role"] == "admin"
 
 
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    parser = argparse.ArgumentParser(description="Admin credential manager")
-    parser.add_argument("--change",   action="store_true", help="Change admin password")
-    parser.add_argument("--add",      action="store_true", help="Add new admin user")
-    parser.add_argument("--list",     action="store_true", help="List all admins")
-    parser.add_argument("--username", default="admin")
-    args = parser.parse_args()
-
-    init_admin_db()
-
-    if args.list:
-        print("Admin users:", list_admins())
-
-    elif args.change:
-        old = input("Current password: ")
-        new = input("New password: ")
-        confirm = input("Confirm new password: ")
-        if new != confirm:
-            print("Passwords don't match.")
-        elif change_password(args.username, old, new):
-            print(f"Password changed for '{args.username}'")
-        else:
-            print("Wrong current password.")
-
-    elif args.add:
-        uname = input("New admin username: ")
-        pwd   = input("Password: ")
-        if add_admin(uname, pwd):
-            print(f"Admin '{uname}' created.")
-        else:
-            print(f"Username '{uname}' already exists.")
-
-    else:
-        parser.print_help()
+# Legacy admin helpers (kept for backward compatibility with old admin panel)
+def init_admin_db(): init_db()
+def list_admins(): return [u["username"] for u in list_users() if u["role"] == "admin"]
+def add_admin(username, password): return register_user(username, password)[0]
