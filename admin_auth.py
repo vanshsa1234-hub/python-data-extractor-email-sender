@@ -216,6 +216,57 @@ def clear_user_leads(user_id: int) -> int:
     return n
 
 
+def replace_user_leads(user_id: int, leads: list[dict]) -> int:
+    """
+    Replace ALL leads for a user with the given list.
+    Deletes every existing lead first, then inserts the new ones.
+    Use this when you want to overwrite (e.g. after verification removes invalid emails).
+    Returns count of rows inserted.
+    """
+    init_db()
+    conn = _conn()
+    conn.execute("DELETE FROM user_leads WHERE user_id=?", (user_id,))
+    inserted = 0
+    for lead in leads:
+        email   = lead.get("email", "").strip().lower()
+        phone   = str(lead.get("phone", "")).strip()
+        website = lead.get("website", lead.get("url", lead.get("source", ""))).strip()
+        if not email:
+            continue
+        try:
+            conn.execute(
+                "INSERT INTO user_leads (user_id, email, phone, website) VALUES (?,?,?,?)",
+                (user_id, email, phone, website)
+            )
+            inserted += 1
+        except sqlite3.Error:
+            pass
+    conn.commit()
+    conn.close()
+    return inserted
+
+
+def delete_emails_for_user(user_id: int, emails: list[str]) -> int:
+    """
+    Delete specific emails from a user's leads.
+    Returns count deleted.
+    """
+    if not emails:
+        return 0
+    init_db()
+    conn = _conn()
+    deleted = 0
+    for email in emails:
+        conn.execute(
+            "DELETE FROM user_leads WHERE user_id=? AND email=?",
+            (user_id, email.strip().lower())
+        )
+        deleted += conn.total_changes
+    conn.commit()
+    conn.close()
+    return deleted
+
+
 # ── Admin functions ────────────────────────────────────────────────────────────
 
 def list_users() -> list[dict]:

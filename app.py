@@ -1024,6 +1024,7 @@ st.set_page_config(
 from admin_auth import (
     init_db, login_user, register_user,
     save_user_leads, get_user_leads, delete_user_lead, clear_user_leads,
+    replace_user_leads, delete_emails_for_user,
     list_users, delete_user, change_password,
     get_user_lead_count, is_admin_user, verify_credentials
 )
@@ -1738,6 +1739,12 @@ elif page == "✅ Verify Emails":
         "(no emails are sent during verification)."
     )
 
+    # ── Session state keys for persisting verify results across reruns ──────────
+    if "verify_csv_results" not in st.session_state:
+        st.session_state.verify_csv_results = None
+    if "verify_manual_results" not in st.session_state:
+        st.session_state.verify_manual_results = None
+
     tab_csv, tab_manual = st.tabs(["📋 Verify from leads.csv", "✏️ Verify manually"])
 
     with tab_csv:
@@ -1745,7 +1752,7 @@ elif page == "✅ Verify Emails":
         if df.empty:
             st.info("No leads found. Scrape some URLs first.")
         else:
-            st.markdown(f"**{len(df)} leads in leads.csv**")
+            st.markdown(f"**{len(df)} leads in your account**")
             show_cols = [c for c in ["email", "phone", "website"] if c in df.columns]
             st.dataframe(df[show_cols].fillna(""), use_container_width=True, height=200)
 
@@ -1760,47 +1767,60 @@ elif page == "✅ Verify Emails":
                     help="Risky = DNS passed but SMTP inconclusive.")
 
             if st.button("🔍 Verify All Emails", type="primary"):
-                from scraper.email_verifier import verify_bulk, filter_verified
+                from scraper.email_verifier import verify_bulk
                 emails_list = df["email"].dropna().tolist()
                 progress_bar = st.progress(0, text="Verifying…")
                 with st.spinner(f"Verifying {len(emails_list)} emails…"):
                     results = verify_bulk(emails_list, smtp_check=smtp_check,
                                           max_workers=workers, delay=0.3)
                 progress_bar.progress(1.0, text="Done!")
+                # ── Store in session state so the save button survives the next rerun ──
+                st.session_state.verify_csv_results = results
 
-                ver_df = pd.DataFrame(results)[["email","status","reason","mx"]]
-                st.dataframe(ver_df, use_container_width=True)
+            # ── Render results + save button from session state (persists across reruns) ──
+            if st.session_state.verify_csv_results is not None:
+                results = st.session_state.verify_csv_results
 
                 from collections import Counter
+                ver_df = pd.DataFrame(results)[["email", "status", "reason", "mx"]]
+                st.dataframe(ver_df, use_container_width=True)
+
                 counts = Counter(r["status"] for r in results)
-                c1,c2,c3,c4,c5 = st.columns(5)
+                c1, c2, c3, c4, c5 = st.columns(5)
                 c1.metric("✅ Valid",     counts.get("valid",     0))
                 c2.metric("⚠️ Risky",     counts.get("risky",     0))
                 c3.metric("🔄 Catch-all", counts.get("catch_all", 0))
                 c4.metric("❌ Invalid",   counts.get("invalid",   0))
                 c5.metric("⏱️ Timeout",   counts.get("timeout",   0))
 
-                include = ["valid", "catch_all"] + (["risky"] if keep_risky else [])
-                valid_set = {r["email"] for r in results if r["status"] in include}
-                df_clean  = df[df["email"].isin(valid_set)].reset_index(drop=True)
+                include     = ["valid", "catch_all"] + (["risky"] if keep_risky else [])
+                valid_set   = {r["email"] for r in results if r["status"] in include}
+                invalid_set = {r["email"] for r in results if r["status"] not in include}
 
                 st.markdown("---")
-                st.metric("Emails kept", len(df_clean))
-                st.metric("Removed", len(df) - len(df_clean))
+                col_kept, col_removed = st.columns(2)
+                col_kept.metric("✅ Emails kept", len(valid_set))
+                col_removed.metric("❌ Will be removed", len(invalid_set))
 
-                if is_admin():
-                    if st.button("💾 Save verified leads to leads.csv"):
-                        save_leads_df(df_clean)
-                        st.success(f"✅ Saved {len(df_clean)} verified leads")
-                        st.rerun()
-                else:
-                    st.info("🔒 Log in as admin to save verified results back to the CSV.")
+                if invalid_set:
+                    with st.expander(f"🗑️ {len(invalid_set)} emails that will be removed"):
+                        st.write(sorted(invalid_set))
+
+                if st.button("💾 Save — remove invalid emails from my leads", type="primary"):
+                    removed = delete_emails_for_user(current_user_id(), list(invalid_set))
+                    st.session_state.verify_csv_results = None   # clear after save
+                    st.success(
+                        f"✅ Done! Removed {removed} invalid email(s). "
+                        f"{len(valid_set)} verified leads remain. Check the 📋 Leads tab."
+                    )
+                    st.rerun()
 
     with tab_manual:
         st.markdown("Enter emails one per line to verify:")
-        raw_emails = st.text_area("Emails", height=150,
-                                   placeholder="principal@school.com\ninfo@college.edu")
+        raw_emails  = st.text_area("Emails", height=150,
+                                    placeholder="principal@school.com\ninfo@college.edu")
         smtp_manual = st.checkbox("SMTP check", value=True, key="smtp_manual")
+
         if st.button("🔍 Verify", type="primary", key="verify_manual"):
             from scraper.email_verifier import verify_bulk
             emails_list = [e.strip() for e in raw_emails.splitlines() if e.strip()]
@@ -1809,8 +1829,44 @@ elif page == "✅ Verify Emails":
             else:
                 with st.spinner(f"Verifying {len(emails_list)} emails…"):
                     results = verify_bulk(emails_list, smtp_check=smtp_manual, max_workers=3)
-                ver_df = pd.DataFrame(results)[["email","status","reason","mx"]]
-                st.dataframe(ver_df, use_container_width=True)
+                # ── Store in session state so the save button survives the next rerun ──
+                st.session_state.verify_manual_results = results
+
+        # ── Render results + save button from session state ──────────────────────
+        if st.session_state.verify_manual_results is not None:
+            results = st.session_state.verify_manual_results
+
+            from collections import Counter
+            ver_df = pd.DataFrame(results)[["email", "status", "reason", "mx"]]
+            st.dataframe(ver_df, use_container_width=True)
+
+            counts_m = Counter(r["status"] for r in results)
+            mc1, mc2, mc3, mc4, mc5 = st.columns(5)
+            mc1.metric("✅ Valid",     counts_m.get("valid",     0))
+            mc2.metric("⚠️ Risky",     counts_m.get("risky",     0))
+            mc3.metric("🔄 Catch-all", counts_m.get("catch_all", 0))
+            mc4.metric("❌ Invalid",   counts_m.get("invalid",   0))
+            mc5.metric("⏱️ Timeout",   counts_m.get("timeout",   0))
+
+            keep_risky_manual = st.checkbox(
+                "Include risky emails when saving", value=True, key="keep_risky_manual"
+            )
+            include_m = ["valid", "catch_all"] + (["risky"] if keep_risky_manual else [])
+            saveable  = [r for r in results if r["status"] in include_m]
+
+            if saveable:
+                st.markdown(f"**{len(saveable)} email(s)** ready to save.")
+                if st.button("💾 Save verified emails to my leads", type="primary", key="save_manual_verified"):
+                    new_leads = [{"email": r["email"], "phone": "", "website": ""} for r in saveable]
+                    inserted  = save_user_leads(current_user_id(), new_leads)
+                    already   = len(saveable) - inserted
+                    st.session_state.verify_manual_results = None   # clear after save
+                    msg = f"✅ Added {inserted} new verified email(s) to your leads."
+                    if already:
+                        msg += f" ({already} already existed and were skipped.)"
+                    msg += " Check the 📋 Leads tab."
+                    st.success(msg)
+                    st.rerun()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
