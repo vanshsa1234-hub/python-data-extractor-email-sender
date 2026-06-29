@@ -1375,8 +1375,31 @@ elif page == "📧 Email":
         st.warning("No leads found. Add leads first via the Scraper or LinkedIn tab.")
         st.stop()
 
-    st.markdown(f"**{len(df)} leads available in leads.csv**")
+    st.markdown(f"**{len(df)} leads available**")
 
+    # ── Sender credentials ────────────────────────────────────────────────────
+    st.markdown("### 📬 Sender Credentials")
+    st.info(
+        "Gmail requires an **App Password**, not your regular password. "
+        "Enable 2FA first → then go to "
+        "[myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords) "
+        "→ generate a 16-character App Password and paste it below."
+    )
+    cred1, cred2, cred3 = st.columns(3)
+    with cred1:
+        sender_email = st.text_input("Your Gmail address", placeholder="you@gmail.com",
+                                      key="sender_email_input")
+    with cred2:
+        sender_app_password = st.text_input("Gmail App Password (16 chars)", type="password",
+                                             placeholder="abcd efgh ijkl mnop",
+                                             key="sender_pass_input")
+    with cred3:
+        sender_name = st.text_input("Sender display name", placeholder="Your Name",
+                                     key="sender_name_input")
+
+    st.markdown("---")
+
+    # ── Email content & settings ──────────────────────────────────────────────
     col1, col2 = st.columns(2)
     with col1:
         subject_tmpl = st.text_input(
@@ -1397,7 +1420,6 @@ elif page == "📧 Email":
         st.markdown("**Preview** (first lead)")
         if not df.empty:
             sample = df.iloc[0].to_dict()
-            from emailer.sender import render_email
             from jinja2 import Template
             try:
                 preview_subj = Template(subject_tmpl).render(**sample,
@@ -1407,9 +1429,22 @@ elif page == "📧 Email":
                 st.caption("Subject preview error — check Jinja2 syntax")
 
     if st.button("📤 Send Emails", type="primary"):
+        if not dry_run and (not sender_email.strip() or not sender_app_password.strip()):
+            st.error("❌ Enter your Gmail address and App Password above before sending.")
+            st.stop()
+
         from emailer.sender import bulk_send
         from emailer.tracker import is_unsubscribed
         from scraper.cleaner import is_valid_email
+        import config
+
+        # Override config values with what the user typed in the UI
+        if sender_email.strip():
+            config.EMAIL_ADDRESS  = sender_email.strip()
+        if sender_app_password.strip():
+            config.EMAIL_PASSWORD = sender_app_password.strip()
+        if sender_name.strip():
+            config.SENDER_NAME    = sender_name.strip()
 
         leads = df.to_dict("records")
         sendable = [
