@@ -6,19 +6,16 @@ Phase 4 — Automated Follow-Up Drip Sequences
 What this does:
   • Manages a 3-email drip sequence per lead (Day 0, Day 3, Day 7)
   • Tracks which sequence step each lead is on in SQLite
-  • Skips leads who opened/replied or unsubscribed
+  • Skips leads who are unsubscribed
   • APScheduler runs the job daily at a configured time
   • Safe to restart — picks up from wherever it left off
-
-Run standalone:
-    python -m emailer.followup          # starts the scheduler (blocks)
-    python -m emailer.followup --now    # fire one check immediately then exit
+  • Credentials (email + app password) are passed in at runtime — never hardcoded
 """
 
 import logging
 import argparse
 import sqlite3
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date
 from pathlib import Path
 
 from apscheduler.schedulers.blocking import BlockingScheduler
@@ -33,6 +30,11 @@ IST = timezone(timedelta(hours=5, minutes=30))
 def now_ist_str() -> str:
     """Current datetime in IST, formatted like SQLite's default TIMESTAMP."""
     return datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def today_str() -> str:
+    return date.today().isoformat()
+
 
 # ── Drip sequence definition ───────────────────────────────────────────────────
 # Each step: (day_offset, subject_template, body_message)
@@ -79,7 +81,7 @@ def init_sequence_db(db_path: str = "data/sent_log.db") -> sqlite3.Connection:
             current_step  INTEGER DEFAULT 0,
             next_send_at  DATE    NOT NULL,
             status        TEXT    DEFAULT 'active',
-            enrolled_at   TIMESTAMP
+            enrolled_at   TEXT
         )
     """)
     conn.commit()
@@ -94,7 +96,7 @@ def enroll_leads(leads: list[dict], db_path: str = "data/sent_log.db") -> int:
     """
     conn = init_sequence_db(db_path)
     enrolled = 0
-    today = datetime.now().date().isoformat()
+    today = today_str()
 
     for lead in leads:
         email = lead.get("email", "").strip().lower()
@@ -102,9 +104,10 @@ def enroll_leads(leads: list[dict], db_path: str = "data/sent_log.db") -> int:
             continue
         try:
             conn.execute(
-                """INSERT OR IGNORE INTO drip_sequence (email, current_step, next_send_at, enrolled_at)
-                   VALUES (?, 0, ?, ?)""",
-                (email, today, now_ist_str()),
+                """INSERT OR IGNORE INTO drip_sequence
+                   (email, current_step, next_send_at, status, enrolled_at)
+                   VALUES (?, 0, ?, 'active', ?)""",
+                (email, today, today),   # enrolled_at stored as plain DATE string
             )
             if conn.total_changes:
                 enrolled += 1
@@ -120,7 +123,7 @@ def enroll_leads(leads: list[dict], db_path: str = "data/sent_log.db") -> int:
 def get_due_leads(db_path: str = "data/sent_log.db") -> list[dict]:
     """Return leads whose next_send_at is today or earlier and are still active."""
     conn = init_sequence_db(db_path)
-    today = datetime.now().date().isoformat()
+    today = today_str()
     rows = conn.execute(
         """SELECT email, current_step FROM drip_sequence
            WHERE status = 'active'
@@ -133,17 +136,18 @@ def get_due_leads(db_path: str = "data/sent_log.db") -> list[dict]:
 
 
 def advance_step(email: str, db_path: str = "data/sent_log.db") -> None:
-    """Move a lead to the next sequence step or mark as completed."""
+    """Move a lead to the next sequence step, or mark as completed."""
     conn = init_sequence_db(db_path)
     row = conn.execute(
-        "SELECT current_step FROM drip_sequence WHERE email = ?", (email,)
+        "SELECT current_step, enrolled_at FROM drip_sequence WHERE email = ?", (email,)
     ).fetchone()
 
     if not row:
         conn.close()
         return
 
-    next_step = row[0] + 1
+    current_step, enrolled_at_raw = row
+    next_step = current_step + 1
 
     if next_step >= len(DRIP_SEQUENCE):
         conn.execute(
@@ -152,84 +156,67 @@ def advance_step(email: str, db_path: str = "data/sent_log.db") -> None:
         )
         log.info("Sequence completed for %s", email)
     else:
+        # enrolled_at is stored as a plain DATE string (YYYY-MM-DD)
+        try:
+            enrolled_date = date.fromisoformat(str(enrolled_at_raw).strip()[:10])
+        except Exception:
+            enrolled_date = date.today()
+
         day_offset = DRIP_SEQUENCE[next_step][0]
-        # Calculate absolute date from sequence start, not from now
-        enrolled = conn.execute(
-            "SELECT enrolled_at FROM drip_sequence WHERE email=?", (email,)
-        ).fetchone()[0]
-        enrolled_date = datetime.fromisoformat(enrolled.split(" ")[0]).date()
-        next_date = (enrolled_date + timedelta(days=day_offset)).isoformat()
+        next_date  = (enrolled_date + timedelta(days=day_offset)).isoformat()
+
         conn.execute(
             "UPDATE drip_sequence SET current_step=?, next_send_at=? WHERE email=?",
             (next_step, next_date, email),
         )
+        log.info("Advanced %s to step %d, next send %s", email, next_step, next_date)
 
     conn.commit()
     conn.close()
 
 
 def pause_lead(email: str, db_path: str = "data/sent_log.db") -> None:
-    """Pause a lead's sequence (e.g. they replied or unsubscribed)."""
     conn = init_sequence_db(db_path)
-    conn.execute(
-        "UPDATE drip_sequence SET status='paused' WHERE email=?", (email,)
-    )
+    conn.execute("UPDATE drip_sequence SET status='paused' WHERE email=?", (email,))
     conn.commit()
     conn.close()
     log.info("Paused drip sequence for %s", email)
 
 
 def reactivate_lead(email: str, db_path: str = "data/sent_log.db") -> bool:
-    """Resume a paused lead — sets status back to 'active'. Returns True if a row was updated."""
     conn = init_sequence_db(db_path)
-    cur = conn.execute(
-        "UPDATE drip_sequence SET status='active' WHERE email=?", (email,)
-    )
+    cur = conn.execute("UPDATE drip_sequence SET status='active' WHERE email=?", (email,))
     conn.commit()
     updated = cur.rowcount > 0
     conn.close()
-    if updated:
-        log.info("Reactivated drip sequence for %s", email)
     return updated
 
 
 def delete_lead_from_sequence(email: str, db_path: str = "data/sent_log.db") -> bool:
-    """Remove a lead from the drip_sequence table entirely. Returns True if a row was deleted."""
     conn = init_sequence_db(db_path)
     cur = conn.execute("DELETE FROM drip_sequence WHERE email=?", (email,))
     conn.commit()
     deleted = cur.rowcount > 0
     conn.close()
-    if deleted:
-        log.info("Deleted %s from drip sequence", email)
     return deleted
 
 
 def set_lead_step(email: str, step: int, db_path: str = "data/sent_log.db") -> bool:
-    """
-    Manually set a lead's current_step (0, 1, 2...) and recompute next_send_at
-    from today. Useful for testing or correcting a lead's position in the sequence.
-    Returns True if a row was updated.
-    """
+    """Manually set a lead's step and make it due today."""
     if step < 0 or step >= len(DRIP_SEQUENCE):
-        raise ValueError(f"step must be between 0 and {len(DRIP_SEQUENCE) - 1}")
-
+        raise ValueError(f"step must be 0–{len(DRIP_SEQUENCE) - 1}")
     conn = init_sequence_db(db_path)
-    today = datetime.now().date().isoformat()
     cur = conn.execute(
         "UPDATE drip_sequence SET current_step=?, next_send_at=?, status='active' WHERE email=?",
-        (step, today, email),
+        (step, today_str(), email),
     )
     conn.commit()
     updated = cur.rowcount > 0
     conn.close()
-    if updated:
-        log.info("Set %s to step %d, next send today", email, step)
     return updated
 
 
 def get_all_sequence_leads(db_path: str = "data/sent_log.db") -> list[dict]:
-    """Return every lead currently in the drip_sequence table, newest first."""
     conn = init_sequence_db(db_path)
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
@@ -240,7 +227,6 @@ def get_all_sequence_leads(db_path: str = "data/sent_log.db") -> list[dict]:
 
 
 def get_sequence_stats(db_path: str = "data/sent_log.db") -> dict:
-    """Return drip sequence statistics."""
     conn = init_sequence_db(db_path)
     stats = {}
     for status in ("active", "paused", "completed"):
@@ -255,68 +241,128 @@ def get_sequence_stats(db_path: str = "data/sent_log.db") -> dict:
 
 # ── Core drip runner ───────────────────────────────────────────────────────────
 
-def run_drip_job(db_path: str = "data/sent_log.db") -> dict:
+def run_drip_job(
+    db_path: str = "data/sent_log.db",
+    dry_run: bool = False,
+    sender_email: str = None,
+    sender_password: str = None,
+    sender_name: str = None,
+    user_leads: list[dict] = None,   # pass leads from DB so we get name/company
+) -> dict:
     """
     The main job: check who is due, send the right sequence email, advance their step.
-    Called daily by the scheduler (or manually).
-    Returns summary: {sent, skipped, failed}
+
+    Args:
+        db_path:         SQLite path.
+        dry_run:         If True, log but do NOT actually send.
+        sender_email:    Gmail address (overrides config).
+        sender_password: Gmail App Password (overrides config).
+        sender_name:     Display name (overrides config).
+        user_leads:      List of lead dicts from the user DB for personalisation.
+                         If None, only email field is available (no name/company).
+
+    Returns:
+        Summary dict: {sent, skipped, failed, details}
     """
-    from emailer.sender import send_email, render_email, init_db, log_email, daily_send_count
+    from emailer.sender import send_email, init_db, log_email, daily_send_count
     from emailer.tracker import add_tracking_pixel, is_unsubscribed
-    from scraper.web_scraper import load_csv
     from jinja2 import Template
-    from config import DAILY_SEND_LIMIT, LEADS_CSV
+    from config import DAILY_SEND_LIMIT
 
     due = get_due_leads(db_path)
-    log.info("Drip job: %d leads due today", len(due))
+    log.info("Drip job: %d leads due today (dry_run=%s)", len(due), dry_run)
 
     if not due:
-        return {"sent": 0, "skipped": 0, "failed": 0}
+        return {"sent": 0, "skipped": 0, "failed": 0, "details": []}
 
-    # Load full lead data for personalisation
-    all_leads = {l["email"]: l for l in load_csv(LEADS_CSV)}
+    # Build lookup from user leads for personalisation (name, company, etc.)
+    lead_lookup = {}
+    if user_leads:
+        for l in user_leads:
+            em = l.get("email", "").strip().lower()
+            if em:
+                lead_lookup[em] = l
 
     email_conn = init_db(db_path)
     sent = skipped = failed = 0
+    details = []
 
     for item in due:
-        email     = item["email"]
-        step_idx  = item["current_step"]
+        email    = item["email"]
+        step_idx = item["current_step"]
 
-        # Guard: unsubscribed?
+        # Skip unsubscribed
         if is_unsubscribed(email, db_path):
             pause_lead(email, db_path)
             skipped += 1
+            details.append({"email": email, "step": step_idx + 1, "result": "skipped (unsubscribed)"})
             continue
 
         # Daily cap
         if daily_send_count(email_conn) >= DAILY_SEND_LIMIT:
             log.warning("Daily send limit reached — stopping drip job")
+            skipped += len(due) - (sent + skipped + failed)
             break
 
-        # Build the email
+        # Build personalised email
         _, subject_tmpl, body_msg = DRIP_SEQUENCE[step_idx]
-        lead = all_leads.get(email, {"email": email, "name": "", "company": "", "title": ""})
 
-        subject   = Template(subject_tmpl).render(**lead,
-                        first_name=lead.get("name","").split()[0] if lead.get("name") else "there")
-        body_html = render_email(lead, body_msg)
+        lead = lead_lookup.get(email, {"email": email, "name": "", "company": "", "title": ""})
+        name_parts = str(lead.get("name", "")).split()
+        first_name = name_parts[0] if name_parts else "there"
+
+        try:
+            subject = Template(subject_tmpl).render(
+                **lead,
+                first_name=first_name,
+                company=lead.get("company", ""),
+            )
+        except Exception:
+            subject = f"Following up (step {step_idx + 1})"
+
+        # Build HTML body
+        safe_body = body_msg.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        body_html = (
+            f'<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;'
+            f'font-size:15px;color:#222;max-width:600px;line-height:1.6;">'
+            f'<p>Hi {first_name},</p>'
+            f'<p>{safe_body}</p>'
+            f'<p>Best regards,<br><strong>{sender_name or "The Team"}</strong></p>'
+            f'<hr style="border:none;border-top:1px solid #eee;margin:24px 0;">'
+            f'<p style="font-size:12px;color:#999;">You received this because your '
+            f'contact info is publicly available.</p>'
+            f'</body></html>'
+        )
         body_html, open_token = add_tracking_pixel(body_html, email)
 
-        log.info("Drip step %d → %s | Subject: %s", step_idx + 1, email, subject)
+        log.info("Drip step %d → %s | Subject: %s | dry=%s",
+                 step_idx + 1, email, subject, dry_run)
 
-        ok = send_email(email, subject, body_html)
-        if ok:
-            log_email(email_conn, email, subject, f"drip_step_{step_idx + 1}", open_token)
+        if dry_run:
+            log_email(email_conn, email, subject, f"dry_drip_step_{step_idx + 1}", open_token)
             advance_step(email, db_path)
             sent += 1
+            details.append({"email": email, "step": step_idx + 1, "result": "dry_run ✓"})
         else:
-            log_email(email_conn, email, subject, f"failed_drip_step_{step_idx + 1}")
-            failed += 1
+            ok = send_email(
+                email, subject, body_html,
+                from_email=sender_email,
+                from_password=sender_password,
+                from_name=sender_name,
+            )
+            if ok:
+                log_email(email_conn, email, subject, f"drip_step_{step_idx + 1}", open_token)
+                advance_step(email, db_path)
+                sent += 1
+                details.append({"email": email, "step": step_idx + 1, "result": "sent ✓"})
+            else:
+                log_email(email_conn, email, subject, f"failed_drip_step_{step_idx + 1}")
+                failed += 1
+                details.append({"email": email, "step": step_idx + 1, "result": "failed ✗"})
 
     email_conn.close()
-    summary = {"sent": sent, "skipped": skipped, "failed": failed}
-    log.info("Drip job complete: %s", summary)
+    summary = {"sent": sent, "skipped": skipped, "failed": failed, "details": details}
+    log.info("Drip job complete: %s", {k: v for k, v in summary.items() if k != "details"})
     return summary
 
 
@@ -327,21 +373,20 @@ def start_scheduler(
     minute: int = 0,
     db_path: str = "data/sent_log.db",
     background: bool = False,
+    sender_email: str = None,
+    sender_password: str = None,
+    sender_name: str = None,
 ):
-    """
-    Start the APScheduler to run the drip job every day at hour:minute.
-
-    Args:
-        hour:       Hour to run (24h, default 9 = 9 AM)
-        minute:     Minute to run (default 0)
-        db_path:    Path to SQLite DB
-        background: If True, returns scheduler (non-blocking). Else blocks.
-    """
     SchedulerClass = BackgroundScheduler if background else BlockingScheduler
     scheduler = SchedulerClass()
 
     scheduler.add_job(
-        func=lambda: run_drip_job(db_path),
+        func=lambda: run_drip_job(
+            db_path=db_path,
+            sender_email=sender_email,
+            sender_password=sender_password,
+            sender_name=sender_name,
+        ),
         trigger="cron",
         hour=hour,
         minute=minute,
@@ -369,19 +414,17 @@ if __name__ == "__main__":
                         format="%(asctime)s [%(levelname)s] %(message)s")
 
     parser = argparse.ArgumentParser(description="Drip Email Sequence Scheduler")
-    parser.add_argument("--now",  action="store_true", help="Run drip job once immediately")
-    parser.add_argument("--hour", type=int, default=9,  help="Hour to run daily (default 9)")
-    parser.add_argument("--min",  type=int, default=0,  help="Minute to run daily (default 0)")
-    parser.add_argument("--enroll", type=str, default="",
-                        help="CSV path — enroll all leads from this file")
-    parser.add_argument("--stats", action="store_true", help="Print sequence stats and exit")
+    parser.add_argument("--now",    action="store_true", help="Run drip job once immediately")
+    parser.add_argument("--hour",   type=int, default=9,  help="Hour to run daily (default 9)")
+    parser.add_argument("--min",    type=int, default=0,  help="Minute to run daily (default 0)")
+    parser.add_argument("--enroll", type=str, default="", help="CSV path to enroll leads from")
+    parser.add_argument("--stats",  action="store_true",  help="Print sequence stats and exit")
     args = parser.parse_args()
 
     if args.stats:
         print("\n=== Drip Sequence Stats ===")
         for k, v in get_sequence_stats().items():
             print(f"  {k:<12}: {v}")
-        print()
 
     elif args.enroll:
         from scraper.web_scraper import load_csv
