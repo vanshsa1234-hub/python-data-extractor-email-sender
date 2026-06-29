@@ -1436,15 +1436,6 @@ elif page == "📧 Email":
         from emailer.sender import bulk_send
         from emailer.tracker import is_unsubscribed
         from scraper.cleaner import is_valid_email
-        import config
-
-        # Override config values with what the user typed in the UI
-        if sender_email.strip():
-            config.EMAIL_ADDRESS  = sender_email.strip()
-        if sender_app_password.strip():
-            config.EMAIL_PASSWORD = sender_app_password.strip()
-        if sender_name.strip():
-            config.SENDER_NAME    = sender_name.strip()
 
         leads = df.to_dict("records")
         sendable = [
@@ -1463,6 +1454,9 @@ elif page == "📧 Email":
                     subject_template=subject_tmpl,
                     custom_message=custom_msg,
                     dry_run=dry_run,
+                    override_email=sender_email.strip() or None,
+                    override_password=sender_app_password.strip() or None,
+                    override_sender_name=sender_name.strip() or None,
                 )
             progress.progress(1.0, text="Done!")
             st.success(f"✅ {'Dry run' if dry_run else 'Send'} complete!")

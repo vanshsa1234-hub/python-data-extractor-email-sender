@@ -39,20 +39,24 @@ def send_email(
     subject: str,
     body_html: str,
     reply_to: str = "",
+    from_email: str = None,
+    from_password: str = None,
+    from_name: str = None,
 ) -> bool:
     """
     Send a single HTML email via SMTP (Gmail).
 
-    Prerequisites:
-        1. Enable 2-Factor Auth on your Gmail account.
-        2. Generate an App Password at myaccount.google.com/apppasswords
-        3. Set EMAIL_ADDRESS and EMAIL_PASSWORD in config.py
+    Credentials are taken from parameters first; falls back to config.py values.
 
     Returns True on success, False on failure.
     """
+    _email    = from_email    or EMAIL_ADDRESS
+    _password = from_password or EMAIL_PASSWORD
+    _name     = from_name     or SENDER_NAME
+
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
-    msg["From"]    = f"{SENDER_NAME} <{EMAIL_ADDRESS}>"
+    msg["From"]    = f"{_name} <{_email}>"
     msg["To"]      = to
     if reply_to:
         msg["Reply-To"] = reply_to
@@ -63,7 +67,7 @@ def send_email(
         with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
             server.ehlo()
             server.starttls()
-            server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
+            server.login(_email, _password)
             server.send_message(msg)
         return True
     except smtplib.SMTPException as exc:
@@ -186,6 +190,9 @@ def bulk_send(
     email_template: str = DEFAULT_TEMPLATE,
     dry_run: bool = False,
     db_path: str = None,
+    override_email: str = None,
+    override_password: str = None,
+    override_sender_name: str = None,
 ) -> dict:
     """
     Send personalised emails to a list of leads with rate limiting and logging.
@@ -252,7 +259,10 @@ def bulk_send(
             log_email(conn, email, subject, "dry_run", open_token)
             sent += 1
         else:
-            success = send_email(email, subject, body_html)
+            success = send_email(email, subject, body_html,
+                                    from_email=override_email,
+                                    from_password=override_password,
+                                    from_name=override_sender_name)
             if success:
                 log_email(conn, email, subject, "sent", open_token)
                 sent += 1
