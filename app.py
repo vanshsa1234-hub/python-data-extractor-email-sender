@@ -32,7 +32,6 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
-
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 # ── Multi-user session state ──────────────────────────────────────────────────
 from admin_auth import (
