@@ -66,43 +66,6 @@ if not is_logged_in():
     st.title("🚀 Python Data Extractor & Email Sender")
     st.markdown("---")
 
-    # ── First run: no users at all — force admin account creation ─────────────
-    users_exist = len(list_users()) > 0
-    if not users_exist:
-        st.warning("⚠️ **First time setup** — No accounts exist yet.")
-        st.info("Create the **admin account** first. This will be the master account with full access.")
-        with st.form("first_run_setup"):
-            st.subheader("🔐 Create Admin Account")
-            setup_username = st.text_input("Admin username", placeholder="e.g. admin")
-            setup_password = st.text_input("Admin password", type="password",
-                                            help="Min 6 characters — choose something strong")
-            setup_confirm  = st.text_input("Confirm password", type="password")
-            setup_btn      = st.form_submit_button("✅ Create Admin Account", type="primary")
-
-        if setup_btn:
-            if setup_password != setup_confirm:
-                st.error("❌ Passwords don't match.")
-            elif len(setup_password) < 6:
-                st.error("❌ Password must be at least 6 characters.")
-            else:
-                # Register as admin role directly
-                from admin_auth import _conn as _auth_conn, _hash as _ahash
-                init_db()
-                _ac = _auth_conn()
-                try:
-                    _ac.execute(
-                        "INSERT INTO users (username, password_hash, role) VALUES (?,?,?)",
-                        (setup_username.strip().lower(), _ahash(setup_password), "admin")
-                    )
-                    _ac.commit()
-                    _ac.close()
-                    st.success(f"✅ Admin account '{setup_username}' created! Please log in.")
-                    st.rerun()
-                except Exception as e:
-                    _ac.close()
-                    st.error(f"❌ Error: {e}")
-        st.stop()
-
     # ── Normal login/register ──────────────────────────────────────────────────
     col_l, col_r = st.columns(2)
 
@@ -1159,3 +1122,4 @@ elif page == "🔐 Admin":
                 st.success("✅ Password changed.")
             else:
                 st.error("❌ Current password is incorrect.")
+
