@@ -139,6 +139,52 @@ with st.sidebar:
         tabs,
         label_visibility="collapsed",
     )
+
+    with st.sidebar.expander("📖 How to Use", expanded=False):
+        st.markdown("""
+    ### 🚀 Workflow
+
+    #### 1️⃣ 🌐 Web Scrape
+    - Enter one or more website URLs.
+    - Extract emails, phone numbers, and company details.
+
+    ⬇️
+
+    #### 2️⃣ 💼 LinkedIn Scrape *(Optional)*
+    - Search by keyword and location.
+    - Import LinkedIn leads into the system.
+
+    ⬇️
+
+    #### 3️⃣ 🧹 Lead Cleaner
+    - Remove duplicate leads.
+    - Clean and organize the extracted data.
+
+    ⬇️
+
+    #### 4️⃣ ✅ Email Verification / 📧 Drip Sequence
+    - Verify emails using Syntax, DNS, and SMTP checks.
+    - Enroll valid leads into automated drip campaigns (Day 0, Day 3, Day 7).
+
+    ⬇️
+
+    #### 5️⃣ 📨 Bulk Email Sender
+    - Create personalized email templates.
+    - Send emails individually or in bulk through Gmail.
+
+    ⬇️
+
+    #### 6️⃣ 📊 Analytics
+    - Monitor campaign performance.
+    - View:
+    - Emails Sent
+    - Open Rate
+    - Click Rate
+    - Failed Emails
+    - Drip Campaign Status
+    """)
+
+    
     st.markdown("---")
     st.caption(f"📅 {datetime.now().strftime('%d %b %Y')}")
     st.markdown(
