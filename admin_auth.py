@@ -457,6 +457,86 @@ def is_admin_user(user_id: int) -> bool:
 
 
 # Legacy admin helpers (kept for backward compatibility with old admin panel)
-def init_admin_db(): init_db()
-def list_admins(): return [u["username"] for u in list_users() if u["role"] == "admin"]
-def add_admin(username, password): return register_user(username, password)[0]
+
+def init_admin_db() -> None:
+    """
+    Initialize the DB and ensure a default admin account exists.
+
+    Creates username 'admin' / password 'admin123' if no admin
+    account is present yet. Safe to call multiple times.
+    """
+    init_db()
+    conn = _conn()
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM users WHERE role='admin' LIMIT 1"
+        ).fetchone()
+        if row is None:
+            try:
+                conn.execute(
+                    "INSERT INTO users (username, password_hash, role) VALUES (?,?,?)",
+                    ("admin", _hash("admin123"), "admin")
+                )
+                conn.commit()
+            except sqlite3.IntegrityError:
+                pass
+    finally:
+        conn.close()
+
+
+def list_admins() -> list[str]:
+    """Return usernames of all admin accounts."""
+    return [u["username"] for u in list_users() if u["role"] == "admin"]
+
+
+def add_admin(username: str, password: str) -> bool:
+    """
+    Add a new admin account directly (legacy admin panel).
+    Returns True on success, False if the username is taken or invalid.
+    """
+    username = username.strip().lower()
+    if not username or not password:
+        return False
+    init_db()
+    conn = _conn()
+    try:
+        conn.execute(
+            "INSERT INTO users (username, password_hash, role) VALUES (?,?,?)",
+            (username, _hash(password), "admin")
+        )
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+    finally:
+        conn.close()
+
+
+def delete_admin(username: str) -> bool:
+    """
+    Delete an admin account. Refuses to delete the last remaining admin.
+    Returns True if deleted, False otherwise.
+    """
+    username = username.strip().lower()
+    init_db()
+    conn = _conn()
+    try:
+        admin_rows = conn.execute(
+            "SELECT id FROM users WHERE role='admin'"
+        ).fetchall()
+        if len(admin_rows) <= 1:
+            return False
+
+        row = conn.execute(
+            "SELECT id FROM users WHERE username=? AND role='admin'",
+            (username,)
+        ).fetchone()
+        if row is None:
+            return False
+
+        conn.execute("DELETE FROM user_leads WHERE user_id=?", (row["id"],))
+        conn.execute("DELETE FROM users WHERE id=?", (row["id"],))
+        conn.commit()
+        return True
+    finally:
+        conn.close()
